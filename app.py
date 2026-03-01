@@ -11,684 +11,684 @@ import asyncio
 import aiohttp
 import logging
 import ipaddress
-import subprocess
+import hmac
+import time
+import json
 from aiohttp import web
+from urllib.parse import quote
 
-# 环境变量
-UUID = os.environ.get('UUID', '7bd180e8-1142-4387-93f5-03e8d750a896')   # 节点UUID
-NEZHA_SERVER = os.environ.get('NEZHA_SERVER', '')    # 哪吒v0填写格式: nezha.xxx.com  哪吒v1填写格式: nezha.xxx.com:8008
-NEZHA_PORT = os.environ.get('NEZHA_PORT', '')        # 哪吒v1请留空，哪吒v0 agent端口
-NEZHA_KEY = os.environ.get('NEZHA_KEY', '')          # 哪吒v0或v1密钥，哪吒面板后台命令里获取
-DOMAIN = os.environ.get('DOMAIN', '')                # 项目分配的域名或反代后的域名,不包含https://前缀,例如: domain.xxx.com
-SUB_PATH = os.environ.get('SUB_PATH', 'sub')         # 节点订阅token
-NAME = os.environ.get('NAME', '')                    # 节点名称
-WSPATH = os.environ.get('WSPATH', UUID[:8])          # 节点路径
-PORT = int(os.environ.get('SERVER_PORT') or os.environ.get('PORT') or 3000)  # http和ws端口，默认自动优先获取容器分配的端口
-AUTO_ACCESS = os.environ.get('AUTO_ACCESS', '').lower() == 'true' # 自动访问保活,默认关闭,true开启,false关闭,需同时填写DOMAIN变量
-DEBUG = os.environ.get('DEBUG', '').lower() == 'true' # 保持默认,调试使用,true开启调试
+# =============================================================================
+# 配置 - 通过环境变量设置
+# =============================================================================
 
-# 全局变量
-CurrentDomain = DOMAIN
-CurrentPort = 443
-Tls = 'tls'
-ISP = ''
+UUID = os.environ.get('UUID', '233dcb7e-7044-4a22-ab64-287338a11d53')
+DOMAIN = os.environ.get('DOMAIN', '')
+NAME = os.environ.get('NAME', '')
+PORT = int(os.environ.get('SERVER_PORT') or os.environ.get('PORT') or 3000)
+DEBUG = os.environ.get('DEBUG', '').lower() == 'true'
 
-# dns server
-DNS_SERVERS = ['8.8.4.4', '1.1.1.1']
-BLOCKED_DOMAINS = [
-    'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
-    'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org'
-]
+# 路径派生：基于UUID自动生成，也可通过环境变量覆盖
+def _derive(purpose):
+    return hmac.new(UUID.encode(), purpose.encode(), hashlib.sha256).hexdigest()[:10]
 
-# 日志级别
-log_level = logging.DEBUG if DEBUG else logging.INFO
+WS_PATH = os.environ.get('WSPATH') or _derive('ws')
+SUB_PATH = os.environ.get('SUB_PATH') or _derive('sub')
+
+# 内部常量
+UUID_NO_DASH = UUID.replace('-', '')
+UUID_BYTES = bytes.fromhex(UUID_NO_DASH)
+TROJAN_HASH = hashlib.sha224(UUID.encode()).hexdigest()
+BUFFER_SIZE = 16384
+MAX_CONCURRENT = 50
+CONNECT_TIMEOUT = 10
+
+# =============================================================================
+# 日志
+# =============================================================================
+
 logging.basicConfig(
-    level=log_level,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
 )
-
-# 禁用访问,连接等日志
-logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
-logging.getLogger('aiohttp.server').setLevel(logging.WARNING)
-logging.getLogger('aiohttp.client').setLevel(logging.WARNING)
-logging.getLogger('aiohttp.internal').setLevel(logging.WARNING)
-logging.getLogger('aiohttp.websocket').setLevel(logging.WARNING)
-
+for _m in ['aiohttp.access', 'aiohttp.server', 'aiohttp.client',
+           'aiohttp.internal', 'aiohttp.websocket']:
+    logging.getLogger(_m).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-def is_port_available(port, host='0.0.0.0'):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind((host, port))
+# =============================================================================
+# 安全过滤
+# =============================================================================
+
+BLOCKED_DOMAINS = {
+    'speedtest.cn', 
+    'speedof.me', 'testmy.net', 'bandwidth.place', 'librespeed.org',
+    'speedcheck.org', 'speed.io'
+}
+
+PRIVATE_NETWORKS = [
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('127.0.0.0/8'),
+    ipaddress.ip_network('169.254.0.0/16'),
+    ipaddress.ip_network('::1/128'),
+    ipaddress.ip_network('fc00::/7'),
+    ipaddress.ip_network('fe80::/10'),
+]
+
+def is_blocked(host, port=0):
+    if host:
+        h = host.lower()
+        if any(h == d or h.endswith('.' + d) for d in BLOCKED_DOMAINS):
             return True
-        except OSError:
-            return False
-
-def find_available_port(start_port, max_attempts=100):
-    for port in range(start_port, start_port + max_attempts):
-        if is_port_available(port):
-            return port
-    return None
-
-def is_blocked_domain(host: str) -> bool:
-    if not host:
-        return False
-    host_lower = host.lower()
-    return any(host_lower == blocked or host_lower.endswith('.' + blocked) 
-              for blocked in BLOCKED_DOMAINS)
-
-async def get_isp():
-    global ISP
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get('https://api.ip.sb/geoip', 
-                                 headers={'User-Agent': 'Mozilla/5.0'},
-                                 timeout=3) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    ISP = f"{data.get('country_code', '')}-{data.get('isp', '')}".replace(' ', '_')
-                    return
-    except:
-        pass
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get('http://ip-api.com/json',
-                                 headers={'User-Agent': 'Mozilla/5.0'},
-                                 timeout=3) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    ISP = f"{data.get('countryCode', '')}-{data.get('org', '')}".replace(' ', '_')
-                    return
-    except:
-        pass
-    
-    ISP = 'Unknown'
-
-async def get_ip():
-    global CurrentDomain, Tls, CurrentPort
-    if not DOMAIN or DOMAIN == 'your-domain.com':
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get('https://api-ipv4.ip.sb/ip', timeout=5) as resp:
-                    if resp.status == 200:
-                        ip = await resp.text()
-                        CurrentDomain = ip.strip()
-                        Tls = 'none'
-                        CurrentPort = PORT
-        except Exception as e:
-            logger.error(f'Failed to get IP: {e}')
-            CurrentDomain = 'change-your-domain.com'
-            Tls = 'tls'
-            CurrentPort = 443
-    else:
-        CurrentDomain = DOMAIN
-        Tls = 'tls'
-        CurrentPort = 443
-
-async def resolve_host(host: str) -> str:
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except:
-        pass
-    
-    for dns_server in DNS_SERVERS:
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f'https://dns.google/resolve?name={host}&type=A'
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get('Status') == 0 and data.get('Answer'):
-                            for answer in data['Answer']:
-                                if answer.get('type') == 1:
-                                    return answer.get('data')
-        except:
-            continue
-    
-    return host  # 如果解析失败，返回原始域名
-
-class ProxyHandler:
-    def __init__(self, uuid: str):
-        self.uuid = uuid
-        self.uuid_bytes = bytes.fromhex(uuid)
-        
-    async def handle_vless(self, websocket, first_msg: bytes) -> bool:
-        """处理VLS协议"""
-        try:
-            if len(first_msg) < 18 or first_msg[0] != 0:
-                return False
-            
-            # 验证UUID
-            if first_msg[1:17] != self.uuid_bytes:
-                return False
-            
-            i = first_msg[17] + 19
-            if i + 3 > len(first_msg):
-                return False
-            
-            port = struct.unpack('!H', first_msg[i:i+2])[0]
-            i += 2
-            atyp = first_msg[i]
-            i += 1
-            
-            # 解析地址
-            host = ''
-            if atyp == 1:  # IPv4
-                if i + 4 > len(first_msg):
-                    return False
-                host = '.'.join(str(b) for b in first_msg[i:i+4])
-                i += 4
-            elif atyp == 2:  # 域名
-                if i >= len(first_msg):
-                    return False
-                host_len = first_msg[i]
-                i += 1
-                if i + host_len > len(first_msg):
-                    return False
-                host = first_msg[i:i+host_len].decode()
-                i += host_len
-            elif atyp == 3:  # IPv6
-                if i + 16 > len(first_msg):
-                    return False
-                host = ':'.join(f'{(first_msg[j] << 8) + first_msg[j+1]:04x}' 
-                              for j in range(i, i+16, 2))
-                i += 16
-            else:
-                return False
-            
-            if is_blocked_domain(host):
-                await websocket.close()
-                return False
-            
-            await websocket.send_bytes(bytes([0, 0]))
-            
-            resolved_host = await resolve_host(host)
-            
-            try:
-                reader, writer = await asyncio.open_connection(resolved_host, port)
-                
-                # 发送剩余数据
-                if i < len(first_msg):
-                    writer.write(first_msg[i:])
-                    await writer.drain()
-                
-                # 双向转发
-                async def forward_ws_to_tcp():
-                    try:
-                        async for msg in websocket:
-                            if msg.type == aiohttp.WSMsgType.BINARY:
-                                writer.write(msg.data)
-                                await writer.drain()
-                    except:
-                        pass
-                    finally:
-                        writer.close()
-                        await writer.wait_closed()
-                
-                async def forward_tcp_to_ws():
-                    try:
-                        while True:
-                            data = await reader.read(4096)
-                            if not data:
-                                break
-                            await websocket.send_bytes(data)
-                    except:
-                        pass
-                
-                await asyncio.gather(
-                    forward_ws_to_tcp(),
-                    forward_tcp_to_ws()
-                )
-                
-            except Exception as e:
-                if DEBUG:
-                    logger.error(f"Connection error: {e}")
-            
+        ip = ipaddress.ip_address(host)
+        if any(ip in net for net in PRIVATE_NETWORKS):
             return True
-            
-        except Exception as e:
-            if DEBUG:
-                logger.error(f"VLESS handler error: {e}")
-            return False
-    
-    async def handle_trojan(self, websocket, first_msg: bytes) -> bool:
-        """处理Tro协议"""
-        try:
-            if len(first_msg) < 58:
-                return False
-            
-            received_hash_bytes = first_msg[:56]
-            
-            # 验证密码 - 支持标准UUID和无短横线UUID
-            hash_obj1 = hashlib.sha224()
-            hash_obj1.update(self.uuid.encode())
-            expected_hash_hex1 = hash_obj1.hexdigest()
-            
-            # 尝试使用标准UUID（带短横线）
-            standard_uuid = UUID
-            hash_obj2 = hashlib.sha224()
-            hash_obj2.update(standard_uuid.encode())
-            expected_hash_hex2 = hash_obj2.hexdigest()
-            
-            # 转换为hex字符串进行比较
-            received_hash_hex = received_hash_bytes.decode('ascii', errors='ignore')
-            
-            # 检查是否匹配任一UUID格式
-            if received_hash_hex != expected_hash_hex1 and received_hash_hex != expected_hash_hex2:
-                return False
-            
-            offset = 56
-            if first_msg[offset:offset+2] == b'\r\n':
-                offset += 2
-            
-            cmd = first_msg[offset]
-            if cmd != 1:
-                return False
-            offset += 1
-            
-            atyp = first_msg[offset]
-            offset += 1
-            
-            # 解析地址
-            host = ''
-            if atyp == 1:  # IPv4
-                host = '.'.join(str(b) for b in first_msg[offset:offset+4])
-                offset += 4
-            elif atyp == 3:  # 域名
-                host_len = first_msg[offset]
-                offset += 1
-                host = first_msg[offset:offset+host_len].decode()
-                offset += host_len
-            elif atyp == 4:  # IPv6
-                host = ':'.join(f'{(first_msg[j] << 8) + first_msg[j+1]:04x}' 
-                              for j in range(offset, offset+16, 2))
-                offset += 16
-            else:
-                return False
-            
-            port = struct.unpack('!H', first_msg[offset:offset+2])[0]
-            offset += 2
-            
-            if first_msg[offset:offset+2] == b'\r\n':
-                offset += 2
-            
-            if is_blocked_domain(host):
-                await websocket.close()
-                return False
-            
-            # 连接目标
-            resolved_host = await resolve_host(host)
-            
-            try:
-                reader, writer = await asyncio.open_connection(resolved_host, port)
-                
-                if offset < len(first_msg):
-                    writer.write(first_msg[offset:])
-                    await writer.drain()
-                
-                async def forward_ws_to_tcp():
-                    try:
-                        async for msg in websocket:
-                            if msg.type == aiohttp.WSMsgType.BINARY:
-                                writer.write(msg.data)
-                                await writer.drain()
-                    except:
-                        pass
-                    finally:
-                        writer.close()
-                        await writer.wait_closed()
-                
-                async def forward_tcp_to_ws():
-                    try:
-                        while True:
-                            data = await reader.read(4096)
-                            if not data:
-                                break
-                            await websocket.send_bytes(data)
-                    except:
-                        pass
-                
-                await asyncio.gather(
-                    forward_ws_to_tcp(),
-                    forward_tcp_to_ws()
-                )
-                
-            except Exception as e:
-                if DEBUG:
-                    logger.error(f"Connection error: {e}")
-            
-            return True
-            
-        except Exception as e:
-            if DEBUG:
-                logger.error(f"Tro handler error: {e}")
-            return False
-    
-    async def handle_shadowsocks(self, websocket, first_msg: bytes) -> bool:
-        """处理ss协议"""
-        try:
-            if len(first_msg) < 7:
-                return False
-            
-            offset = 0
-            atyp = first_msg[offset]
-            offset += 1
-            
-            # 解析地址
-            host = ''
-            if atyp == 1:  # IPv4
-                if offset + 4 > len(first_msg):
-                    return False
-                host = '.'.join(str(b) for b in first_msg[offset:offset+4])
-                offset += 4
-            elif atyp == 3:  # 域名
-                if offset >= len(first_msg):
-                    return False
-                host_len = first_msg[offset]
-                offset += 1
-                if offset + host_len > len(first_msg):
-                    return False
-                host = first_msg[offset:offset+host_len].decode()
-                offset += host_len
-            elif atyp == 4:  # IPv6
-                if offset + 16 > len(first_msg):
-                    return False
-                host = ':'.join(f'{(first_msg[j] << 8) + first_msg[j+1]:04x}' 
-                              for j in range(offset, offset+16, 2))
-                offset += 16
-            else:
-                return False
-            
-            if offset + 2 > len(first_msg):
-                return False
-            port = struct.unpack('!H', first_msg[offset:offset+2])[0]
-            offset += 2
-            
-            if is_blocked_domain(host):
-                await websocket.close()
-                return False
-            
-            # 连接目标
-            resolved_host = await resolve_host(host)
-            
-            try:
-                reader, writer = await asyncio.open_connection(resolved_host, port)
-                
-                if offset < len(first_msg):
-                    writer.write(first_msg[offset:])
-                    await writer.drain()
-                
-                async def forward_ws_to_tcp():
-                    try:
-                        async for msg in websocket:
-                            if msg.type == aiohttp.WSMsgType.BINARY:
-                                writer.write(msg.data)
-                                await writer.drain()
-                    except:
-                        pass
-                    finally:
-                        writer.close()
-                        await writer.wait_closed()
-                
-                async def forward_tcp_to_ws():
-                    try:
-                        while True:
-                            data = await reader.read(4096)
-                            if not data:
-                                break
-                            await websocket.send_bytes(data)
-                    except:
-                        pass
-                
-                await asyncio.gather(
-                    forward_ws_to_tcp(),
-                    forward_tcp_to_ws()
-                )
-                
-            except Exception as e:
-                if DEBUG:
-                    logger.error(f"Connection error: {e}")
-            
-            return True
-            
-        except Exception as e:
-            if DEBUG:
-                logger.error(f"Shadowsocks handler error: {e}")
-            return False
-
-async def websocket_handler(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    CUUID = UUID.replace('-', '')
-    path = request.path
-    
-    if f'/{WSPATH}' not in path:
-        await ws.close()
-        return ws
-    
-    proxy = ProxyHandler(CUUID)
-    
-    try:
-        first_msg = await asyncio.wait_for(ws.receive(), timeout=5)
-        if first_msg.type != aiohttp.WSMsgType.BINARY:
-            await ws.close()
-            return ws
-        
-        msg_data = first_msg.data
-        
-        # 尝试VLS
-        if len(msg_data) > 17 and msg_data[0] == 0:
-            if await proxy.handle_vless(ws, msg_data):
-                return ws
-        
-        # 尝试Tro
-        if len(msg_data) >= 58:
-            if await proxy.handle_trojan(ws, msg_data):
-                return ws
-        
-        # 尝试ss
-        if len(msg_data) > 0 and msg_data[0] in (1, 3, 4):
-            if await proxy.handle_shadowsocks(ws, msg_data):
-                return ws
-        
-        await ws.close()
-        
-    except asyncio.TimeoutError:
-        await ws.close()
-    except Exception as e:
-        if DEBUG:
-            logger.error(f"WebSocket handler error: {e}")
-        await ws.close()
-    
-    return ws
-
-async def http_handler(request):
-    if request.path == '/':
-        try:
-            with open('index.html', 'r', encoding='utf-8') as f:
-                content = f.read()
-            return web.Response(text=content, content_type='text/html')
-        except:
-            return web.Response(text='Hello world!', content_type='text/html')
-    
-    elif request.path == f'/{SUB_PATH}':
-        await get_isp()
-        await get_ip()
-        
-        name_part = f"{NAME}-{ISP}" if NAME else ISP
-        tls_param = 'tls' if Tls == 'tls' else 'none'
-        ss_tls_param = 'tls;' if Tls == 'tls' else ''
-        
-        # 生成配置链接
-        vless_url = f"vless://{UUID}@{CurrentDomain}:{CurrentPort}?encryption=none&security={tls_param}&sni={CurrentDomain}&fp=chrome&type=ws&host={CurrentDomain}&path=%2F{WSPATH}#{name_part}"
-        trojan_url = f"trojan://{UUID}@{CurrentDomain}:{CurrentPort}?security={tls_param}&sni={CurrentDomain}&fp=chrome&type=ws&host={CurrentDomain}&path=%2F{WSPATH}#{name_part}"
-        
-        ss_method_password = base64.b64encode(f"none:{UUID}".encode()).decode()
-        ss_url = f"ss://{ss_method_password}@{CurrentDomain}:{CurrentPort}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D{CurrentDomain};path%3D%2F{WSPATH};{ss_tls_param}sni%3D{CurrentDomain};skip-cert-verify%3Dtrue;mux%3D0#{name_part}"
-        
-        subscription = f"{vless_url}\n{trojan_url}\n{ss_url}"
-        base64_content = base64.b64encode(subscription.encode()).decode()
-        
-        return web.Response(text=base64_content + '\n', content_type='text/plain')
-    
-    return web.Response(status=404, text='Not Found\n')
-
-def get_download_url():
-    import platform
-    arch = platform.machine()
-    
-    if 'arm' in arch.lower() or 'aarch64' in arch.lower():
-        if not NEZHA_PORT:
-            return 'https://arm64.eooce.com/v1'
-        else:
-            return 'https://arm64.eooce.com/agent'
-    else:
-        if not NEZHA_PORT:
-            return 'https://amd64.eooce.com/v1'
-        else:
-            return 'https://amd64.eooce.com/agent'
-
-async def download_file():
-    if not NEZHA_SERVER and not NEZHA_KEY:
-        return
-    
-    try:
-        url = get_download_url()
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    content = await resp.read()
-                    with open('npm', 'wb') as f:
-                        f.write(content)
-                    os.chmod('npm', 0o755)
-                    logger.info('✅ npm downloaded successfully')
-    except Exception as e:
-        logger.error(f'Download failed: {e}')
-
-async def run_nezha():
-    try:
-        result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
-        if './npm' in result.stdout and '[n]pm' in result.stdout:
-            logger.info('npm is already running, skip...')
-            return
-    except:
+    except ValueError:
         pass
-    
-    # 等待文件下载完成
-    await download_file()
-    
-    command = ''
-    tls_ports = ['443', '8443', '2096', '2087', '2083', '2053']
-    if NEZHA_SERVER and NEZHA_PORT and NEZHA_KEY:
-        nezha_tls = '--tls' if NEZHA_PORT in tls_ports else ''
-        command = f'nohup ./npm -s {NEZHA_SERVER}:{NEZHA_PORT} -p {NEZHA_KEY} {nezha_tls} --disable-auto-update --report-delay 4 --skip-conn --skip-procs >/dev/null 2>&1 &'
-    elif NEZHA_SERVER and NEZHA_KEY:
-        if not NEZHA_PORT:
-            port = NEZHA_SERVER.split(':')[-1] if ':' in NEZHA_SERVER else ''
-            nz_tls = 'true' if port in tls_ports else 'false'
-            config = f"""client_secret: {NEZHA_KEY}
-debug: false
-disable_auto_update: true
-disable_command_execute: false
-disable_force_update: true
-disable_nat: false
-disable_send_query: false
-gpu: false
-insecure_tls: true
-ip_report_period: 1800
-report_delay: 4
-server: {NEZHA_SERVER}
-skip_connection_count: true
-skip_procs_count: true
-temperature: false
-tls: {nz_tls}
-use_gitee_to_upgrade: false
-use_ipv6_country_code: false
-uuid: {UUID}"""
+    if port in (25, 465, 587):
+        return True
+    return False
 
-            with open('config.yaml', 'w') as f:
-                f.write(config)
+# =============================================================================
+# DNS 缓存
+# =============================================================================
 
-        command = f'nohup ./npm -c config.yaml >/dev/null 2>&1 &'
-    else:
-        return
-    
-    try:
-        subprocess.Popen(command, shell=True, executable='/bin/bash')
-        logger.info('✅ nz started successfully')
-    except Exception as e:
-        logger.error(f'Error running nz: {e}')
+class DNSCache:
+    def __init__(self, ttl=300):
+        self._cache = {}
+        self._ttl = ttl
 
-async def add_access_task():
-    if not AUTO_ACCESS or not DOMAIN:
-        return
-    
-    full_url = f"https://{DOMAIN}/{SUB_PATH}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post("https://oooo.serv00.net/add-url",
-                             json={"url": full_url},
-                             headers={'Content-Type': 'application/json'})
-        logger.info('Automatic Access Task added successfully')
-    except:
-        pass
-
-def cleanup_files():
-    for file in ['npm', 'config.yaml']:
+    async def resolve(self, host):
         try:
-            if os.path.exists(file):
-                os.remove(file)
-        except:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
             pass
 
+        now = time.time()
+        cached = self._cache.get(host)
+        if cached and now < cached[1]:
+            return cached[0]
+
+        ip = await self._query(host)
+        if ip:
+            self._cache[host] = (ip, now + self._ttl)
+            if len(self._cache) > 500:
+                self._evict(now)
+        return ip or host
+
+    async def _query(self, host):
+        endpoints = [
+            ('https://dns.google/resolve', {}),
+            ('https://cloudflare-dns.com/dns-query', {'Accept': 'application/dns-json'}),
+        ]
+        for url, headers in endpoints:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        f'{url}?name={host}&type=A',
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=3)
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            if data.get('Status') == 0:
+                                for a in data.get('Answer', []):
+                                    if a.get('type') == 1:
+                                        return a['data']
+            except Exception:
+                continue
+        return None
+
+    def _evict(self, now):
+        expired = [k for k, (_, t) in self._cache.items() if t <= now]
+        for k in expired:
+            del self._cache[k]
+
+dns_cache = DNSCache()
+
+# =============================================================================
+# 缓冲区读取器
+# =============================================================================
+
+class BufferReader:
+    __slots__ = ('data', 'pos')
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+
+    @property
+    def remaining(self):
+        return len(self.data) - self.pos
+
+    def byte(self):
+        if self.pos >= len(self.data):
+            raise ValueError("underflow")
+        v = self.data[self.pos]
+        self.pos += 1
+        return v
+
+    def read(self, n):
+        if self.pos + n > len(self.data):
+            raise ValueError("underflow")
+        v = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return v
+
+    def uint16(self):
+        return struct.unpack('!H', self.read(2))[0]
+
+    def ipv4(self):
+        return '.'.join(str(b) for b in self.read(4))
+
+    def ipv6(self):
+        return str(ipaddress.IPv6Address(self.read(16)))
+
+    def domain(self):
+        length = self.byte()
+        return self.read(length).decode('ascii')
+
+    def skip_crlf(self):
+        if (self.pos + 2 <= len(self.data) and
+                self.data[self.pos:self.pos + 2] == b'\r\n'):
+            self.pos += 2
+
+    def rest(self):
+        v = self.data[self.pos:]
+        self.pos = len(self.data)
+        return v
+
+# =============================================================================
+# 协议解析
+# =============================================================================
+
+def parse_address(buf, atyp):
+    """通用地址解析"""
+    if atyp == 1:   return buf.ipv4()
+    elif atyp == 2: return buf.domain()
+    elif atyp == 3: return buf.domain()
+    elif atyp == 4: return buf.ipv6()
+    raise ValueError(f"unknown atyp: {atyp}")
+
+
+def parse_vless(data):
+    try:
+        buf = BufferReader(data)
+        if buf.byte() != 0:
+            return None
+        if buf.read(16) != UUID_BYTES:
+            return None
+        addon_len = buf.byte()
+        if addon_len:
+            buf.read(addon_len)
+        cmd = buf.byte()
+        if cmd != 1:
+            return None
+        port = buf.uint16()
+        atyp = buf.byte()
+        host = parse_address(buf, atyp)
+        return host, port, b'\x00\x00', buf.rest()
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def parse_trojan(data):
+    try:
+        if len(data) < 58:
+            return None
+        buf = BufferReader(data)
+        received = buf.read(56).decode('ascii')
+        if received != TROJAN_HASH:
+            return None
+        buf.skip_crlf()
+        if buf.byte() != 1:
+            return None
+        atyp = buf.byte()
+        if atyp == 1:   host = buf.ipv4()
+        elif atyp == 3: host = buf.domain()
+        elif atyp == 4: host = buf.ipv6()
+        else: return None
+        port = buf.uint16()
+        buf.skip_crlf()
+        return host, port, None, buf.rest()
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def parse_shadowsocks(data):
+    try:
+        if not data or data[0] not in (1, 3, 4):
+            return None
+        buf = BufferReader(data)
+        atyp = buf.byte()
+        if atyp == 1:   host = buf.ipv4()
+        elif atyp == 3: host = buf.domain()
+        elif atyp == 4: host = buf.ipv6()
+        else: return None
+        port = buf.uint16()
+        return host, port, None, buf.rest()
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def detect_protocol(data):
+    if len(data) > 17 and data[0] == 0:
+        r = parse_vless(data)
+        if r:
+            return 'vless', r
+
+    if len(data) >= 58:
+        r = parse_trojan(data)
+        if r:
+            return 'trojan', r
+
+    if len(data) > 3 and data[0] in (1, 3, 4):
+        r = parse_shadowsocks(data)
+        if r:
+            return 'ss', r
+
+    return None, None
+
+# =============================================================================
+# 双向转发
+# =============================================================================
+
+_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+async def relay(ws, host, port, initial=None):
+    reader = writer = None
+    try:
+        resolved = await dns_cache.resolve(host)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(resolved, port),
+            timeout=CONNECT_TIMEOUT
+        )
+
+        if initial:
+            writer.write(initial)
+            await writer.drain()
+
+        async def ws_to_tcp():
+            try:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        writer.write(msg.data)
+                        await writer.drain()
+                    elif msg.type in (aiohttp.WSMsgType.ERROR,
+                                      aiohttp.WSMsgType.CLOSE,
+                                      aiohttp.WSMsgType.CLOSING):
+                        break
+            except (ConnectionError, OSError):
+                pass
+
+        async def tcp_to_ws():
+            try:
+                while True:
+                    chunk = await reader.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    await ws.send_bytes(chunk)
+            except (ConnectionError, OSError):
+                pass
+
+        t1 = asyncio.create_task(ws_to_tcp())
+        t2 = asyncio.create_task(tcp_to_ws())
+        _, pending = await asyncio.wait(
+            [t1, t2], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    except asyncio.TimeoutError:
+        logger.debug(f"Timeout → {host}:{port}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug(f"Relay error: {e}")
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+# =============================================================================
+# WebSocket 处理
+# =============================================================================
+
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    acquired = False
+
+    try:
+        if _semaphore.locked():
+            return ws
+
+        await _semaphore.acquire()
+        acquired = True
+
+        msg = await asyncio.wait_for(ws.receive(), timeout=5)
+        if msg.type != aiohttp.WSMsgType.BINARY:
+            return ws
+
+        proto, result = detect_protocol(msg.data)
+        if not result:
+            return ws
+
+        host, port, response, payload = result
+
+        if is_blocked(host, port):
+            logger.debug(f"Blocked: {host}:{port}")
+            return ws
+
+        logger.debug(f"[{proto}] → {host}:{port}")
+
+        if response:
+            await ws.send_bytes(response)
+
+        await relay(ws, host, port, payload or None)
+
+    except asyncio.TimeoutError:
+        pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug(f"WS error: {e}")
+    finally:
+        if acquired:
+            _semaphore.release()
+        if not ws.closed:
+            await ws.close()
+
+    return ws
+
+# =============================================================================
+# 网络信息（ISP + IP 检测）
+# =============================================================================
+
+_net_info = {'domain': '', 'port': 443, 'tls': 'tls', 'isp': ''}
+_net_ready = False
+
+async def init_net_info():
+    global _net_ready
+    if _net_ready:
+        return
+
+    # 获取 ISP
+    for url, cc, isp in [
+        ('https://api.ip.sb/geoip', 'country_code', 'isp'),
+        ('http://ip-api.com/json', 'countryCode', 'org'),
+    ]:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url,
+                    headers={'User-Agent': 'Mozilla/5.0'},
+                    timeout=aiohttp.ClientTimeout(total=3)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        _net_info['isp'] = f"{d.get(cc,'')}-{d.get(isp,'')}".replace(' ','_')
+                        break
+        except Exception:
+            continue
+
+    if not _net_info['isp']:
+        _net_info['isp'] = 'Unknown'
+
+    # 域名/IP
+    if DOMAIN:
+        _net_info['domain'] = DOMAIN
+        _net_info['tls'] = 'tls'
+        _net_info['port'] = 443
+    else:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get('https://api-ipv4.ip.sb/ip',
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    if r.status == 200:
+                        _net_info['domain'] = (await r.text()).strip()
+                        _net_info['tls'] = 'none'
+                        _net_info['port'] = PORT
+        except Exception:
+            _net_info['domain'] = 'your-domain.com'
+
+    _net_ready = True
+
+# =============================================================================
+# 伪装首页
+# =============================================================================
+
+FAKE_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TaskFlow - Project Management</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#f0f2f5;color:#1a1a2e;line-height:1.6}
+.nav{background:#1a1a2e;color:#fff;padding:1rem 2rem;display:flex;
+justify-content:space-between;align-items:center}
+.nav h1{font-size:1.4rem}
+.nav a{color:#8888aa;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+.wrap{max-width:1100px;margin:2rem auto;padding:0 1.5rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1.2rem}
+.card{background:#fff;border-radius:10px;padding:1.4rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card h3{margin-bottom:.4rem;font-size:1rem}
+.card p{color:#666;font-size:.88rem}
+.num{font-size:1.8rem;font-weight:700;color:#4361ee}
+.bar{background:#e9ecef;border-radius:8px;height:6px;margin-top:.8rem}
+.bar>div{background:#4361ee;height:100%;border-radius:8px}
+.tag{display:inline-block;padding:.15rem .6rem;border-radius:12px;font-size:.75rem}
+.g{background:#d4edda;color:#155724}
+.b{background:#cce5ff;color:#004085}
+.y{background:#fff3cd;color:#856404}
+footer{text-align:center;padding:2rem;color:#aaa;font-size:.8rem}
+</style>
+</head>
+<body>
+<div class="nav"><h1>TaskFlow</h1><nav>
+<a href="#">Dashboard</a><a href="#">Projects</a><a href="#">Team</a>
+</nav></div>
+<div class="wrap">
+<h2 style="margin-bottom:1.2rem">Dashboard</h2>
+<div class="grid">
+<div class="card"><h3>Active Projects</h3><div class="num">12</div>
+<p>3 due this week</p><div class="bar"><div style="width:75%"></div></div></div>
+<div class="card"><h3>Tasks Done</h3><div class="num">847</div>
+<p>+23 this week</p><div class="bar"><div style="width:62%"></div></div></div>
+<div class="card"><h3>Team</h3><div class="num">16</div>
+<p>4 online</p><div class="bar"><div style="width:90%"></div></div></div>
+<div class="card"><h3>Activity</h3>
+<p><span class="tag g">Done</span> UI review</p>
+<p><span class="tag b">Active</span> API work</p>
+<p><span class="tag y">Pending</span> Migration</p></div>
+</div></div>
+<footer>2024 TaskFlow Inc.</footer>
+</body></html>"""
+
+# =============================================================================
+# HTTP 路由处理
+# =============================================================================
+
+_start_time = time.time()
+
+async def index_handler(request):
+    return web.Response(text=FAKE_PAGE, content_type='text/html')
+
+async def health_handler(request):
+    return web.json_response({
+        'status': 'healthy',
+        'uptime': int(time.time() - _start_time),
+        'version': '2.1.0'
+    })
+
+async def api_projects(request):
+    return web.json_response({
+        'projects': [
+            {'id': 1, 'name': 'Website Redesign', 'progress': 75},
+            {'id': 2, 'name': 'Mobile App', 'progress': 45},
+        ],
+        'total': 2
+    })
+
+async def api_tasks(request):
+    return web.json_response({
+        'tasks': [
+            {'id': 1, 'title': 'Fix login bug', 'status': 'done'},
+            {'id': 2, 'title': 'Add dark mode', 'status': 'active'},
+        ],
+        'total': 2
+    })
+
+async def robots_handler(request):
+    return web.Response(
+        text="User-agent: *\nDisallow: /api/\nAllow: /\n",
+        content_type='text/plain'
+    )
+
+async def favicon_handler(request):
+    return web.Response(status=204)
+
+
+# ---------- 订阅 ----------
+
+async def sub_handler(request):
+    """
+    访问方式: https://域名/{SUB_PATH}
+    和原版一样简单直接
+    """
+    await init_net_info()
+
+    i = _net_info
+    name = f"{NAME}-{i['isp']}" if NAME else i['isp']
+    d = i['domain']
+    p = i['port']
+    tls = i['tls']
+    ws = quote(f'/{WS_PATH}', safe='')
+
+    links = []
+
+    # VLESS (v2rayN 原生支持)
+    links.append(
+        f"vless://{UUID}@{d}:{p}"
+        f"?encryption=none&security={tls}&sni={d}"
+        f"&fp=chrome&type=ws&host={d}&path={ws}"
+        f"#{name}"
+    )
+
+    # Trojan (v2rayN 原生支持)
+    links.append(
+        f"trojan://{UUID}@{d}:{p}"
+        f"?security={tls}&sni={d}"
+        f"&fp=chrome&type=ws&host={d}&path={ws}"
+        f"#{name}"
+    )
+
+    # Shadowsocks (需要 v2ray-plugin)
+    ss_cred = base64.b64encode(f"none:{UUID}".encode()).decode()
+    ss_tls = 'tls;' if tls == 'tls' else ''
+    links.append(
+        f"ss://{ss_cred}@{d}:{p}"
+        f"?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D{d}"
+        f";path%3D{ws};{ss_tls}"
+        f"sni%3D{d};skip-cert-verify%3Dtrue;mux%3D0"
+        f"#{name}"
+    )
+
+    content = base64.b64encode('\n'.join(links).encode()).decode()
+    return web.Response(text=content + '\n', content_type='text/plain')
+
+# =============================================================================
+# 中间件
+# =============================================================================
+
+@web.middleware
+async def headers_middleware(request, handler):
+    try:
+        resp = await handler(request)
+    except web.HTTPNotFound:
+        return web.json_response({'error': 'Not found'}, status=404)
+    except web.HTTPException as e:
+        raise e
+    resp.headers['Server'] = 'nginx'
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['X-Frame-Options'] = 'DENY'
+    return resp
+
+# =============================================================================
+# 启动
+# =============================================================================
+
+def find_port(start, attempts=100):
+    for p in range(start, start + attempts):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('0.0.0.0', p))
+            s.close()
+            return p
+        except OSError:
+            continue
+    return None
+
+
 async def main():
-    actual_port = PORT
-    
-    # 检查端口是否可用，如果不可用则查找可用端口
-    if not is_port_available(actual_port):
-        logger.warning(f"Port {actual_port} is already in use, finding available port...")
-        new_port = find_available_port(actual_port + 1)
-        if new_port:
-            actual_port = new_port
-            logger.info(f"Using port {actual_port} instead of {PORT}")
-        else:
-            logger.error("No available ports found")
-            sys.exit(1)
-    
-    app = web.Application()
-    
-    # 路由
-    app.router.add_get('/', http_handler)
-    app.router.add_get(f'/{SUB_PATH}', http_handler)
-    app.router.add_get(f'/{WSPATH}', websocket_handler)
-    
-    # 启动服务
-    runner = web.AppRunner(app)
+    port = find_port(PORT)
+    if not port:
+        logger.error("No available port")
+        sys.exit(1)
+
+    app = web.Application(middlewares=[headers_middleware])
+
+    # ---- 伪装路由（让网站看起来正常）----
+    app.router.add_get('/', index_handler)
+    app.router.add_get('/favicon.ico', favicon_handler)
+    app.router.add_get('/robots.txt', robots_handler)
+    app.router.add_get('/api/health', health_handler)
+    app.router.add_get('/api/v1/projects', api_projects)
+    app.router.add_get('/api/v1/tasks', api_tasks)
+
+    # ---- 核心路由 ----
+    # WebSocket 代理入口
+    app.router.add_get(f'/{WS_PATH}', ws_handler)
+    # 订阅接口：和原版一样，域名/路径 即可访问
+    app.router.add_get(f'/{SUB_PATH}', sub_handler)
+
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', actual_port)
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"✅ server is running on port {actual_port}")
-    asyncio.create_task(run_nezha())
-    async def delayed_cleanup():
-        await asyncio.sleep(180)
-        cleanup_files()
-    
-    asyncio.create_task(delayed_cleanup())
-    
-    await add_access_task()
-    
+
+    # 打印使用信息
+    logger.info("=" * 60)
+    logger.info("  Server started successfully")
+    logger.info(f"  Port      : {port}")
+    logger.info(f"  WS Path   : /{WS_PATH}")
+    logger.info(f"  Sub Path  : /{SUB_PATH}")
+    if DOMAIN:
+        logger.info(f"  Sub URL   : https://{DOMAIN}/{SUB_PATH}")
+    else:
+        logger.info(f"  Sub URL   : http://localhost:{port}/{SUB_PATH}")
+    logger.info("=" * 60)
+
     try:
         await asyncio.Future()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         await runner.cleanup()
+
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nServer stopped by user")
-        cleanup_files()
+        pass
